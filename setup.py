@@ -1,4 +1,4 @@
-# Copyright 2017 Uber Technologies, Inc. All Rights Reserved.
+# Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ tensorflow_mpi_lib = Extension('horovod.tensorflow.mpi_lib', [])
 torch_mpi_lib = Extension('horovod.torch.mpi_lib', [])
 torch_mpi_lib_impl = Extension('horovod.torch.mpi_lib_impl', [])
 torch_mpi_lib_v2 = Extension('horovod.torch.mpi_lib_v2', [])
+mxnet_mpi_lib = Extension('horovod.mxnet.mpi_lib', [])
 
 
 def is_build_action():
@@ -65,9 +66,24 @@ def check_tf_version():
             'Your TensorFlow version is outdated.  Horovod requires tensorflow>=1.1.0')
 
 
+def check_mx_version():
+    try:
+        import mxnet as mx
+        if mx.__version__ < '1.4.0':
+            raise DistutilsPlatformError(
+                'Your MXNet version %s is outdated.  '
+                'Horovod requires mxnet>=1.4.0' % mx.__version__)
+    except ImportError:
+        raise DistutilsPlatformError(
+            'import mxnet failed, is it installed?\n\n%s' % traceback.format_exc())
+    except AttributeError:
+        raise DistutilsPlatformError(
+            'Your MXNet version is outdated.  Horovod requires mxnet>1.3.0')
+
+
 def get_cpp_flags(build_ext):
     last_err = None
-    default_flags = ['-std=c++11', '-fPIC', '-O2']
+    default_flags = ['-std=c++11', '-fPIC', '-O2', '-Wall']
     avx_flags = ['-mf16c', '-mavx']
     if sys.platform == 'darwin':
         # Darwin most likely will have Clang, which has libc++.
@@ -221,6 +237,60 @@ def get_tf_flags(build_ext, cpp_flags):
         return compile_flags, link_flags
 
 
+def get_mx_include_dirs():
+    import mxnet as mx
+    return [mx.libinfo.find_include_path()]
+
+
+def get_mx_lib_dirs():
+    import mxnet as mx
+    mx_libs = mx.libinfo.find_lib_path()
+    mx_lib_dirs = [os.path.dirname(mx_lib) for mx_lib in mx_libs]
+    return mx_lib_dirs
+
+
+def get_mx_libs(build_ext, lib_dirs, cpp_flags):
+    last_err = None
+    for mx_libs in [['mxnet'], []]:
+        try:
+            lib_file = test_compile(build_ext, 'test_mx_libs',
+                                    library_dirs=lib_dirs, libraries=mx_libs,
+                                    extra_compile_preargs=cpp_flags,
+                                    code=textwrap.dedent('''\
+                    void test() {
+                    }
+                    '''))
+
+            return mx_libs
+        except (CompileError, LinkError):
+            last_err = 'Unable to determine -l link flags to use with MXNet (see error above).'
+        except Exception:
+            last_err = 'Unable to determine -l link flags to use with MXNet.  ' \
+                       'Last error:\n\n%s' % traceback.format_exc()
+
+    raise DistutilsPlatformError(last_err)
+
+
+def get_mx_flags(build_ext, cpp_flags):
+    mx_include_dirs = get_mx_include_dirs()
+    mx_lib_dirs = get_mx_lib_dirs()
+    mx_libs = get_mx_libs(build_ext, mx_lib_dirs, cpp_flags)
+
+    compile_flags = []
+    for include_dir in mx_include_dirs:
+        compile_flags.append('-I%s' % include_dir)
+
+    link_flags = []
+    for lib_dir in mx_lib_dirs:
+        link_flags.append('-Wl,-rpath,%s' % lib_dir)
+        link_flags.append('-L%s' % lib_dir)
+
+    for lib in mx_libs:
+        link_flags.append('-l%s' % lib)
+
+    return compile_flags, link_flags
+
+
 def get_mpi_flags():
     show_command = os.environ.get('HOROVOD_MPICXX_SHOW', 'mpicxx -show')
     try:
@@ -359,20 +429,49 @@ def get_nccl_vals(build_ext, cuda_include_dirs, cuda_lib_dirs, cpp_flags):
     return nccl_include_dirs, nccl_lib_dirs, nccl_libs
 
 
-def get_ddl_dirs():
-    # Default DDL home
-    ddl_home = '/opt/DL/ddl'
-    ddl_include_dir = '%s/include' % ddl_home
-    ddl_lib_dir = '%s/lib' % ddl_home
+def get_ddl_dirs(build_ext, cuda_include_dirs, cuda_lib_dirs, cpp_flags):
+    ddl_include_dirs = []
+    ddl_lib_dirs = []
 
-    if not os.path.exists(ddl_lib_dir):
-        raise DistutilsPlatformError(
-            'DDL lib was not found. Please, make sure \'ddl\' package is installed.')
-    if not os.path.exists(ddl_include_dir):
-        raise DistutilsPlatformError(
-            'DDL include was not found. Please, make sure \'ddl-dev\' package is installed.')
+    ddl_home = os.environ.get('HOROVOD_DDL_HOME')
+    if ddl_home:
+        ddl_include_dirs += ['%s/include' % ddl_home]
+        ddl_lib_dirs += ['%s/lib' % ddl_home, '%s/lib64' % ddl_home]
 
-    return [ddl_include_dir], [ddl_lib_dir]
+    ddl_include_dir = os.environ.get('HOROVOD_DDL_INCLUDE')
+    if ddl_include_dir:
+        ddl_include_dirs += [ddl_include_dir]
+
+    ddl_lib_dir = os.environ.get('HOROVOD_DDL_LIB')
+    if ddl_lib_dir:
+        ddl_lib_dirs += [ddl_lib_dir]
+
+    # Keep DDL legacy folders for backward compatibility
+    if not ddl_include_dirs:
+        ddl_include_dirs += ['/opt/DL/ddl/include']
+    if not ddl_lib_dirs:
+        ddl_lib_dirs += ['/opt/DL/ddl/lib']
+
+    try:
+        test_compile(build_ext, 'test_ddl', libraries=['ddl', 'ddl_pack'],
+                     include_dirs=ddl_include_dirs + cuda_include_dirs,
+                     library_dirs=ddl_lib_dirs + cuda_lib_dirs, extra_compile_preargs=cpp_flags,
+                     code=textwrap.dedent('''\
+                     #include <ddl.hpp>
+                     void test() {
+                     }
+                     '''))
+    except (CompileError, LinkError):
+        raise DistutilsPlatformError(
+            'IBM PowerAI DDL library was not found (see error above).\n'
+            'Please specify correct DDL location with the HOROVOD_DDL_HOME '
+            'environment variable or combination of HOROVOD_DDL_INCLUDE and '
+            'HOROVOD_DDL_LIB environment variables.\n\n'
+            'HOROVOD_DDL_HOME - path where DDL include and lib directories can be found\n'
+            'HOROVOD_DDL_INCLUDE - path to DDL include directory\n'
+            'HOROVOD_DDL_LIB - path to DDL lib directory')
+
+    return ddl_include_dirs, ddl_lib_dirs
 
 
 def get_common_options(build_ext):
@@ -413,7 +512,8 @@ def get_common_options(build_ext):
 
     if gpu_allreduce == 'DDL':
         have_ddl = True
-        ddl_include_dirs, ddl_lib_dirs = get_ddl_dirs()
+        ddl_include_dirs, ddl_lib_dirs = get_ddl_dirs(build_ext, cuda_include_dirs,
+                                                      cuda_lib_dirs, cpp_flags)
     else:
         have_ddl = False
         ddl_include_dirs = ddl_lib_dirs = []
@@ -424,13 +524,33 @@ def get_common_options(build_ext):
                              'If you\'re sure you want to mix them, set the '
                              'HOROVOD_ALLOW_MIXED_GPU_IMPL environment variable to \'1\'.')
 
-    MACROS = []
-    INCLUDES = []
+    MACROS = [('EIGEN_MPL2_ONLY', 1)]
+    INCLUDES = ['third_party/eigen',
+                'third_party/lbfgs/include',
+                'third_party/boost/assert/include',
+                'third_party/boost/config/include',
+                'third_party/boost/core/include',
+                'third_party/boost/detail/include',
+                'third_party/boost/iterator/include',
+                'third_party/boost/lockfree/include',
+                'third_party/boost/mpl/include',
+                'third_party/boost/parameter/include',
+                'third_party/boost/predef/include',
+                'third_party/boost/preprocessor/include',
+                'third_party/boost/static_assert/include',
+                'third_party/boost/type_traits/include',
+                'third_party/boost/utility/include',
+                'third_party/flatbuffers/include']
     SOURCES = ['horovod/common/common.cc',
-               'horovod/common/mpi_message.cc',
+               'horovod/common/fusion_buffer_manager.cc',
                'horovod/common/half.cc',
+               'horovod/common/message.cc',
                'horovod/common/operations.cc',
-               'horovod/common/timeline.cc']
+               'horovod/common/parameter_manager.cc',
+               'horovod/common/timeline.cc',
+               'horovod/common/optim/bayesian_optimization.cc',
+               'horovod/common/optim/gaussian_process.cc',
+               'horovod/common/logging.cc']
     COMPILE_FLAGS = cpp_flags + shlex.split(mpi_flags)
     LINK_FLAGS = link_flags + shlex.split(mpi_flags)
     LIBRARY_DIRS = []
@@ -504,6 +624,33 @@ def parse_version(version_str):
     if m.group(4) is not None:
         version += int(m.group(4))
     return version
+
+
+def build_mx_extension(build_ext, options):
+    check_mx_version()
+    mx_compile_flags, mx_link_flags = get_mx_flags(
+        build_ext, options['COMPILE_FLAGS'])
+
+    mxnet_mpi_lib.define_macros = options['MACROS']
+    if check_macro(options['MACROS'], 'HAVE_CUDA'):
+        mxnet_mpi_lib.define_macros += [('MSHADOW_USE_CUDA', '1')]
+    else:
+        mxnet_mpi_lib.define_macros += [('MSHADOW_USE_CUDA', '0')]
+    mxnet_mpi_lib.define_macros += [('MSHADOW_USE_MKL', '0')]
+    mxnet_mpi_lib.include_dirs = options['INCLUDES']
+    mxnet_mpi_lib.sources = options['SOURCES'] + \
+        ['horovod/mxnet/mpi_ops.cc',
+         'horovod/mxnet/ready_event.cc',
+         'horovod/mxnet/tensor_util.cc',
+         'horovod/mxnet/cuda_util.cc',
+         'horovod/mxnet/adapter.cc']
+    mxnet_mpi_lib.extra_compile_args = options['COMPILE_FLAGS'] + \
+        mx_compile_flags
+    mxnet_mpi_lib.extra_link_args = options['LINK_FLAGS'] + mx_link_flags
+    mxnet_mpi_lib.library_dirs = options['LIBRARY_DIRS']
+    mxnet_mpi_lib.libraries = options['LIBRARIES']
+
+    build_ext.build_extension(mxnet_mpi_lib)
 
 
 def dummy_import_torch():
@@ -603,7 +750,8 @@ def build_torch_extension(build_ext, options, torch_version):
 
     # Export TORCH_VERSION equal to our representation of torch.__version__. Internally it's
     # used for backwards compatibility checks.
-    updated_macros = set_macro(updated_macros, 'TORCH_VERSION', str(torch_version))
+    updated_macros = set_macro(
+        updated_macros, 'TORCH_VERSION', str(torch_version))
 
     # Create_extension overwrites these files which are customized, we need to protect them.
     with protect_files('horovod/torch/mpi_lib/__init__.py',
@@ -665,7 +813,8 @@ def build_torch_extension_v2(build_ext, options, torch_version):
 
     # Export TORCH_VERSION equal to our representation of torch.__version__. Internally it's
     # used for backwards compatibility checks.
-    updated_macros = set_macro(updated_macros, 'TORCH_VERSION', str(torch_version))
+    updated_macros = set_macro(
+        updated_macros, 'TORCH_VERSION', str(torch_version))
 
     # Always set _GLIBCXX_USE_CXX11_ABI, since PyTorch can only detect whether it was set to 1.
     import torch
@@ -673,7 +822,8 @@ def build_torch_extension_v2(build_ext, options, torch_version):
                                str(int(torch.compiled_with_cxx11_abi())))
 
     # PyTorch requires -DTORCH_API_INCLUDE_EXTENSION_H
-    updated_macros = set_macro(updated_macros, 'TORCH_API_INCLUDE_EXTENSION_H', '1')
+    updated_macros = set_macro(
+        updated_macros, 'TORCH_API_INCLUDE_EXTENSION_H', '1')
 
     if have_cuda:
         from torch.utils.cpp_extension import CUDAExtension as TorchExtension
@@ -734,32 +884,44 @@ class custom_build_ext(build_ext):
                     built_plugins.append(False)
                 else:
                     raise
+        if not os.environ.get('HOROVOD_WITHOUT_MXNET'):
+            try:
+                build_mx_extension(self, options)
+                built_plugins.append(True)
+            except:
+                if not os.environ.get('HOROVOD_WITH_MXNET'):
+                    print('INFO: Unable to build MXNet plugin, will skip it.\n\n'
+                          '%s' % traceback.format_exc(), file=sys.stderr)
+                    built_plugins.append(False)
+                else:
+                    raise
         if not built_plugins:
             raise DistutilsError(
-                'Both TensorFlow and PyTorch plugins were excluded from build. Aborting.')
+                'TensorFlow, PyTorch, and MXNet plugins were excluded from build. Aborting.')
         if not any(built_plugins):
             raise DistutilsError(
-                'Neither TensorFlow nor PyTorch plugins were built. See errors above.')
+                'None of TensorFlow, PyTorch, or MXNet plugins were built. See errors above.')
 
 
 setup(name='horovod',
       version=__version__,
       packages=find_packages(),
-      description='Distributed training framework for TensorFlow, Keras, and PyTorch.',
+      description='Distributed training framework for TensorFlow, Keras, PyTorch, and MXNet.',
       author='Uber Technologies, Inc.',
       long_description=textwrap.dedent('''\
-          Horovod is a distributed training framework for TensorFlow, Keras, and PyTorch.
+          Horovod is a distributed training framework for TensorFlow, Keras, PyTorch, and MXNet.
           The goal of Horovod is to make distributed Deep Learning fast and easy to use.'''),
       url='https://github.com/uber/horovod',
       classifiers=[
           'License :: OSI Approved :: Apache Software License'
       ],
-      ext_modules=[tensorflow_mpi_lib, torch_mpi_lib, torch_mpi_lib_impl, torch_mpi_lib_v2],
+      ext_modules=[tensorflow_mpi_lib, torch_mpi_lib, torch_mpi_lib_impl,
+                   torch_mpi_lib_v2, mxnet_mpi_lib],
       cmdclass={'build_ext': custom_build_ext},
       # cffi is required for PyTorch
       # If cffi is specified in setup_requires, it will need libffi to be installed on the machine,
       # which is undesirable.  Luckily, `install` action will install cffi before executing build,
       # so it's only necessary for `build*` or `bdist*` actions.
-      setup_requires=['cffi>=1.4.0'] if is_build_action() else [],
-      install_requires=['cffi>=1.4.0'],
+      setup_requires=['cffi>=1.4.0', 'cloudpickle', 'psutil', 'six'] if is_build_action() else [],
+      install_requires=['cffi>=1.4.0', 'cloudpickle', 'psutil', 'six'],
       zip_safe=False)

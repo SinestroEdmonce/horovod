@@ -36,7 +36,7 @@ TorchPersistentBuffer::AccessData(std::shared_ptr<OpContext> context) const {
 
 TorchTensor::TorchTensor(::torch::Tensor tensor) : tensor_(tensor) {}
 
-const MPIDataType TorchTensor::dtype() const {
+const DataType TorchTensor::dtype() const {
   switch (tensor_.scalar_type()) {
   case ::torch::kByte:
     return common::HOROVOD_UINT8;
@@ -61,7 +61,7 @@ const MPIDataType TorchTensor::dtype() const {
 
 const TensorShape TorchTensor::shape() const {
   TensorShape shape;
-  for (int idx = 0; idx < tensor_.dim(); idx++) {
+  for (int idx = 0; idx < tensor_.dim(); ++idx) {
     shape.AddDim(tensor_.size(idx));
   }
   return shape;
@@ -87,7 +87,8 @@ TorchOpContext::AllocatePersistent(int64_t size,
 Status TorchOpContext::AllocateOutput(TensorShape shape,
                                       std::shared_ptr<Tensor>* tensor) {
   std::vector<int64_t> shape_vector;
-  for (int idx = 0; idx < shape.dims(); idx++) {
+  shape_vector.reserve(shape.dims());
+  for (int idx = 0; idx < shape.dims(); ++idx) {
     shape_vector.push_back(shape.dim_size(idx));
   }
   with_device device_context(device_);

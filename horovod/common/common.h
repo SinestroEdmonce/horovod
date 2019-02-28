@@ -19,7 +19,7 @@
 #include <memory>
 #include <string>
 
-#include "mpi_message.h"
+#include "message.h"
 
 namespace horovod {
 namespace common {
@@ -28,7 +28,7 @@ namespace common {
 #define CPU_DEVICE_ID (-1)
 
 // List of supported frameworks.
-enum Framework { TENSORFLOW, PYTORCH };
+enum Framework { TENSORFLOW, PYTORCH, MXNET };
 
 enum StatusType { OK, UNKNOWN_ERROR, PRECONDITION_ERROR, ABORTED, INVALID_ARGUMENT };
 
@@ -90,7 +90,7 @@ public:
 
 class Tensor {
 public:
-  virtual const MPIDataType dtype() const = 0;
+  virtual const DataType dtype() const = 0;
   virtual const TensorShape shape() const = 0;
   virtual const void* data() const = 0;
   virtual int64_t size() const = 0;

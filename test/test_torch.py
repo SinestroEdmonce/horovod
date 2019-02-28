@@ -27,6 +27,7 @@ import tempfile
 import torch
 import torch.nn.functional as F
 import unittest
+import warnings
 
 import horovod.torch as hvd
 
@@ -39,6 +40,10 @@ class TorchTests(unittest.TestCase):
     """
     Tests for ops in horovod.torch.
     """
+
+    def __init__(self, *args, **kwargs):
+        super(TorchTests, self).__init__(*args, **kwargs)
+        warnings.simplefilter('module')
 
     def convert_cpu_fp16_to_fp32(self, *values):
         # PyTorch doesn't support any CPU ops on FP16 tensors.
@@ -348,6 +353,27 @@ class TorchTests(unittest.TestCase):
         except (torch.FatalError, RuntimeError):
             pass
 
+    def test_horovod_allreduce_duplicate_name_error(self):
+        """Test that the allreduce raises an error if there are
+        two concurrent operations with the same name."""
+        hvd.init()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            return
+
+        dims = [17] * 3
+        tensor = torch.FloatTensor(*dims)
+
+        hvd.allreduce_async(tensor, name='duplicate_name')
+        try:
+            for i in range(10):
+                hvd.allreduce_async(tensor, name='duplicate_name')
+            assert False, 'hvd.allreduce_async did not throw error'
+        except (torch.FatalError, ValueError):
+            pass
+
     def test_horovod_allreduce_grad(self):
         """Test the correctness of the allreduce gradient."""
         hvd.init()
@@ -518,6 +544,27 @@ class TorchTests(unittest.TestCase):
             hvd.allgather(tensor)
             assert False, 'hvd.allgather did not throw error'
         except (torch.FatalError, RuntimeError):
+            pass
+
+    def test_horovod_allgather_duplicate_name_error(self):
+        """Test that the allgather raises an error if there are
+        two concurrent operations with the same name."""
+        hvd.init()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            return
+
+        dims = [17] * 3
+        tensor = torch.FloatTensor(*dims)
+
+        hvd.allgather_async(tensor, name='duplicate_name')
+        try:
+            for i in range(10):
+                hvd.allgather_async(tensor, name='duplicate_name')
+            assert False, 'hvd.allgather_async did not throw error'
+        except (torch.FatalError, ValueError):
             pass
 
     def test_horovod_allgather_grad(self):
@@ -695,6 +742,27 @@ class TorchTests(unittest.TestCase):
             hvd.broadcast(tensor, rank)
             assert False, 'hvd.broadcast did not throw error'
         except (torch.FatalError, RuntimeError):
+            pass
+
+    def test_horovod_broadcast_duplicate_name_error(self):
+        """Test that the broadcast raises an error if there are
+        two concurrent operations with the same name."""
+        hvd.init()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            return
+
+        dims = [17] * 3
+        tensor = torch.FloatTensor(*dims)
+
+        hvd.broadcast_async(tensor, root_rank=0, name='duplicate_name')
+        try:
+            for i in range(10):
+                hvd.broadcast_async(tensor, root_rank=0, name='duplicate_name')
+            assert False, 'hvd.broadcast_async did not throw error'
+        except (torch.FatalError, ValueError):
             pass
 
     def test_horovod_broadcast_grad(self):
@@ -1037,3 +1105,107 @@ class TorchTests(unittest.TestCase):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+    def test_model_parallelism(self):
+        """Test that tensors on different GPUs are supported."""
+        # Only do this test if there are GPUs available.
+        if not torch.cuda.is_available():
+            return
+
+        hvd.init()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            return
+
+        class Net(torch.nn.Module):
+            def __init__(self):
+                super(Net, self).__init__()
+                # Place parts of model on different GPUs.
+                self.conv1 = torch.nn.Conv2d(1, 100, 1).cuda(0)
+                self.conv2 = torch.nn.Conv2d(100, 1, 1).cuda(1)
+
+            def forward(self, x):
+                x = x.cuda(0)
+                x = self.conv1(x)
+                x = x.cuda(1)
+                x = self.conv2(x)
+                return x
+
+        model = Net()
+        inp = torch.rand([1, 1, 1000, 1000])
+
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        opt = hvd.DistributedOptimizer(opt, named_parameters=model.named_parameters())
+
+        loss = model(inp).sum()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+    def test_duplicate_names(self):
+        """Test that passing duplicate names to optimizer will fail."""
+        net1 = torch.nn.Conv2d(1, 1, 1)
+        net2 = torch.nn.Conv2d(1, 1, 1)
+
+        parameters = itertools.chain(net1.parameters(), net2.parameters())
+        opt = torch.optim.SGD(parameters, lr=0.1)
+
+        # This will have duplicate names, since both net1 and net2 have 'weight' and 'bias'
+        named_parameters = itertools.chain(net1.named_parameters(), net2.named_parameters())
+        try:
+            hvd.DistributedOptimizer(opt, named_parameters=named_parameters)
+            assert False, 'hvd.DistributedOptimizer did not throw error'
+        except ValueError:
+            pass
+
+    def test_dynamic_requires_grad(self):
+        """Test that makes sure that gradients can be turned off/on dynamically."""
+        hvd.init()
+        size = hvd.size()
+
+        # This test does not apply if there is only one worker.
+        if size == 1:
+            return
+
+        gen = torch.nn.Conv2d(1, 10, 1)
+        disc = torch.nn.Conv2d(10, 1, 1)
+        inp = torch.rand([1, 1, 100, 100])
+
+        gen_opt = torch.optim.SGD(gen.parameters(), lr=0.1)
+        gen_opt = hvd.DistributedOptimizer(gen_opt, named_parameters=gen.named_parameters())
+
+        disc_opt = torch.optim.SGD(disc.parameters(), lr=0.1)
+        disc_opt = hvd.DistributedOptimizer(disc_opt, named_parameters=disc.named_parameters())
+
+        def train_step(train_generator=False, train_discriminator=False):
+            for p in gen.parameters():
+                p.requires_grad_(train_generator)
+            for p in disc.parameters():
+                p.requires_grad_(train_discriminator)
+
+            gen_opt.zero_grad()
+            disc_opt.zero_grad()
+
+            loss = disc(gen(inp)).sum()
+            loss.backward()
+
+            for p in gen.parameters():
+                assert train_generator == p.grad.max().is_nonzero(), \
+                    'Gradient for generator is zero but it should be trained or vice versa.'
+            for p in disc.parameters():
+                assert train_discriminator == p.grad.max().is_nonzero(), \
+                    'Gradient for discriminator is zero but it should be trained or vice versa.'
+
+            if train_generator:
+                gen_opt.step()
+            if train_discriminator:
+                disc_opt.step()
+
+        for x in range(10):
+            # Step 1: train generator.
+            train_step(train_generator=True)
+
+            # Step 2: train discriminator.
+            train_step(train_discriminator=True)
